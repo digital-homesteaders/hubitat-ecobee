@@ -1,0 +1,37 @@
+{
+  "packageName": "Ecobee Connect",
+  "author": "Digital Homesteaders",
+  "version": "0.1.0",
+  "minimumHEVersion": "2.3.3",
+  "dateReleased": "2026-10-17",
+  "documentationLink": "https://github.com/digital-homesteaders/hubitat-ecobee#readme",
+  "licenseFile": "https://raw.githubusercontent.com/digital-homesteaders/hubitat-ecobee/main/LICENSE",
+  "releaseNotes": "First release: ecobee thermostats and room sensors signed in with your ecobee email and password (authenticator or text-message codes supported), summary-first polling, gathered writes.",
+  "apps": [
+    {
+      "id": "b28753ed-11c4-4091-a273-2f711c86cfb6",
+      "name": "Ecobee Connect",
+      "namespace": "ecobeeconnect",
+      "location": "https://raw.githubusercontent.com/digital-homesteaders/hubitat-ecobee/main/apps/ecobee-connect.groovy",
+      "required": true,
+      "oauth": false,
+      "primary": true
+    }
+  ],
+  "drivers": [
+    {
+      "id": "e189a1f5-648a-4eba-9dc9-6af5342bbc7a",
+      "name": "Ecobee Connect Thermostat",
+      "namespace": "ecobeeconnect",
+      "location": "https://raw.githubusercontent.com/digital-homesteaders/hubitat-ecobee/main/drivers/ecobee-connect-thermostat.groovy",
+      "required": true
+    },
+    {
+      "id": "dadc7ea3-9dfb-4cf8-87f1-18791a54caa1",
+      "name": "Ecobee Connect Sensor",
+      "namespace": "ecobeeconnect",
+      "location": "https://raw.githubusercontent.com/digital-homesteaders/hubitat-ecobee/main/drivers/ecobee-connect-sensor.groovy",
+      "required": true
+    }
+  ]
+}
