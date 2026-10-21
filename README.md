@@ -163,7 +163,7 @@ app will need an update; the API part is ecobee's documented API.
 
 The sign-in flow follows [python-ecobee-api](https://github.com/nkgilley/python-ecobee-api)
 (used by Home Assistant) and [ecobee Comfort for Homey](https://github.com/johndellarciprete/ecobeecomfort),
-both MIT licensed. The test harness comes from SolarEdge Connect for Hubitat.
+both MIT licensed (see [NOTICE](NOTICE)). The test harness comes from SolarEdge Connect for Hubitat.
 
 ## License
 

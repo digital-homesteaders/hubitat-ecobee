@@ -1,0 +1,9 @@
+Third-party notice
+
+The ecobee sign-in flow in apps/ecobee-connect.groovy follows these projects,
+both distributed under the MIT License:
+
+- python-ecobee-api, Copyright (c) 2017 Nolan Gilley:
+  https://github.com/nkgilley/python-ecobee-api
+- ecobee Comfort for Homey, Copyright (c) 2026 John Dell'Arciprete:
+  https://github.com/johndellarciprete/ecobeecomfort
