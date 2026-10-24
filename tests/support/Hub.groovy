@@ -178,13 +178,13 @@ abstract class HubitatScript extends Script {
 class Swallow {
     HubitatScript script
     int strategy
-    def input(Map m) { record(m.name, m.defaultValue) }
-    def input(Map m, String name, String type) { record(name, m.defaultValue) }
-    def input(String name, String type) { record(name, null) }
-    def input(Map m, String name) { record(name, m.defaultValue) }
-    private void record(def name, def dflt) {
+    def input(Map m) { record(m.name, m.defaultValue, m.title) }
+    def input(Map m, String name, String type) { record(name, m.defaultValue, m.title) }
+    def input(String name, String type) { record(name, null, null) }
+    def input(Map m, String name) { record(name, m.defaultValue, m.title) }
+    private void record(def name, def dflt, def title) {
         script.declaredInputs[name as String] = dflt
-        script.calls << ["input", name as String]
+        script.calls << ["input", name as String, title?.toString()]
     }
     def methodMissing(String name, def args) {
         if (name == "paragraph") script.calls << ["paragraph", args[0]?.toString()]

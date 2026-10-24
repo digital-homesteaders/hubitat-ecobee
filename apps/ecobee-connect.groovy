@@ -51,6 +51,8 @@ preferences {
 // ecobee's public web client, its callback and API audience (as ecobee.com uses them).
 @Field static final String CLIENT_ID = "183eORFPlXyz9BbDZwqexHPBQoVjgadh"
 @Field static final String REDIRECT_URI = "https://www.ecobee.com/home/authCallback"
+// ecobee's own site, where a sign-in that stops short of the callback may land.
+@Field static final List ECOBEE_HOSTS = ["https://www.ecobee.com", "https://ecobee.com"]
 @Field static final String AUDIENCE = "https://prod.ecobee.com/api/v1"
 // offline_access is what makes Auth0 issue a refresh token.
 @Field static final String SCOPE = "openid smartRead smartWrite piiRead piiWrite offline_access"
@@ -67,8 +69,19 @@ preferences {
 @Field static final long DISCOVER_MS = 60 * 1000L
 // A sign-in still working after this long is shown as failed.
 @Field static final long LOGIN_TIMEOUT_MS = 90 * 1000L
-// Redirects and prompt pages one sign-in may pass through.
+// Redirects one sign-in may pass through.
 @Field static final int LOGIN_MAX_HOPS = 12
+// Where Auth0 sends accounts that sign in with Google, Apple, Facebook or Microsoft, and whose sign-in it is.
+@Field static final Map SOCIAL_HOSTS = ["https://accounts.google.com": "Google", "https://appleid.apple.com": "Apple",
+    "https://www.facebook.com": "Facebook", "https://m.facebook.com": "Facebook",
+    "https://login.live.com": "Microsoft", "https://login.microsoftonline.com": "Microsoft"]
+// The way past a sign-in step the hub can't take.
+@Field static final String IN_BROWSER = "Sign in at ecobee.com in a browser, finish what it asks, then try again."
+// The second press of "end the sign-in at ecobee" must come within this long of the first.
+@Field static final long CONFIRM_MS = 30 * 1000L
+// Auth0's bot detection; the hub can't solve a CAPTCHA.
+@Field static final String WRONG_PASSWORD = "ecobee didn't accept that password. If you sign in to ecobee with Google, Apple, Facebook or Microsoft, set a password at ecobee.com first."
+@Field static final String CAPTCHA_MSG = "ecobee wants a CAPTCHA solved before this sign-in, which the hub can't do. Wait a while before trying again; more tries in a row make it more likely."
 // Refresh the access token when it has less than this left.
 @Field static final long TOKEN_MARGIN_MS = 5 * 60 * 1000L
 // A refresh still unanswered after this long no longer blocks a new one.
@@ -102,10 +115,12 @@ def mainPage() {
     Map lg = state.login ?: [:]
     boolean working = loginWorking()
     boolean finding = discovering()
-    // The page refreshes itself while signing in and until the devices exist.
-    dynamicPage(name: "mainPage", title: "Ecobee Connect", install: true, uninstall: true, refreshInterval: (working || finding) ? 2 : 0) {
+    // The page refreshes itself while signing in, until the devices exist, while ecobee answers a
+    // sign-out, and while waiting for the second press so the button reads right when that ends.
+    dynamicPage(name: "mainPage", title: "Ecobee Connect", install: true, uninstall: true, refreshInterval: (working || finding || revoking()) ? 2 : confirmingRevoke() ? 5 : 0) {
         if (!signedIn()) {
             section("Sign in to ecobee") {
+                if (state.revoke?.failed) paragraph "<b>Signed out on the hub, but ecobee didn't confirm ending the sign-in (HTTP ${state.revoke.failed}).</b> To end it at ecobee, change your ecobee password."
                 if (state.auth?.needsLogin) paragraph "<b>ecobee asked for a new sign-in.</b> Your devices stay in place and come back once you sign in."
                 if (working) {
                     // While ecobee answers, show progress only; the form would look like a failed sign-in.
@@ -127,6 +142,8 @@ def mainPage() {
             section("Account") {
                 paragraph "Signed in as ${state.auth.account ?: 'your ecobee account'}. ${statusLine()}"
                 input "btnSignOut", "button", title: "Sign out"
+                input "btnSignOutEcobee", "button", title: confirmingRevoke() ? "Press again to end the sign-in at ecobee" : "Sign out and end the sign-in at ecobee"
+                paragraph "<small>Sign out forgets the sign-in on this hub. The second button also tells ecobee to end it, which may sign you out of ecobee.com in a browser and other apps that use ecobee's web sign-in (Home Assistant, Homey, this app on another hub).</small>"
             }
             Map names = (state.names ?: [:]) as Map
             section("Thermostats") {
@@ -361,6 +378,11 @@ void appButtonHandler(String btn) {
             break
         case "btnCancel": state.login = null; app.removeSetting("mfaCode"); break
         case "btnSignOut": signOut(); break
+        case "btnSignOutEcobee":
+            // Two presses: this one can sign out other apps too.
+            if (confirmingRevoke()) signOut(true)
+            else state.confirmRevokeUntil = now() + CONFIRM_MS
+            break
         case "btnFind": findThermostats(); break
     }
 }
@@ -410,14 +432,43 @@ private void forgetAccount() {
     app.removeSetting("sensors")
 }
 
-void signOut() {
+/**
+ * Forget the sign-in on the hub. With `atEcobee`, also revoke the refresh token at ecobee.
+ * Auth0 may then end every sign-in of ecobee's web client for this account (ecobee.com in a
+ * browser, other apps using this sign-in), so it's a separate button. Best effort: the hub
+ * forgets the token either way, and the access token lasts until it expires (an hour at most).
+ */
+void signOut(boolean atEcobee = false) {
     unschedule()
+    String refresh = state.auth?.refresh
+    state.revoke = null
+    if (atEcobee && refresh) {
+        state.revoke = [at: now()]
+        authPost("revokeResp", "/oauth/revoke", [client_id: CLIENT_ID, token: refresh])
+    }
+    state.confirmRevokeUntil = null
     state.auth = null
     state.login = null
     state.revs = [:]
     runtime().clear()
     markAllHealth("offline")
     log.info "Ecobee Connect: signed out"
+}
+
+boolean confirmingRevoke() { now() < ((state.confirmRevokeUntil ?: 0) as long) }
+
+/** A revoke sent and not answered yet (or lost: the request timeout plus some slack). */
+boolean revoking() { state.revoke?.at && now() - (state.revoke.at as long) < (REQUEST_TIMEOUT + 5) * 1000L }
+
+void revokeResp(resp, Map data) {
+    int status = statusOf(resp)
+    if (status == 200) {
+        state.revoke = null
+        logDebug "ecobee ended the sign-in"
+        return
+    }
+    state.revoke = [failed: status]
+    log.warn "Ecobee Connect: signed out on the hub, but ecobee didn't confirm ending the sign-in (HTTP ${status}). The hub has forgotten it either way."
 }
 
 private Map runtime() {
@@ -518,6 +569,10 @@ void loginResp(resp, Map data) {
     }
     String body = bodyOf(resp)
     String code = errorCodeIn(body)
+    if (data.step in ["identifier", "password", "mfa"] && isCaptcha(code)) {
+        loginFail(CAPTCHA_MSG)
+        return
+    }
     switch (data.step) {
         case "challenge":
             // The code page itself (loading it is what sends a text message).
@@ -533,15 +588,12 @@ void loginResp(resp, Map data) {
             break
         case "password":
             if (code && code.toLowerCase() =~ /block|lock|too-many|suspend/) loginFail("ecobee has locked sign-ins for this account for now (${code}). Try again later or sign in at ecobee.com.")
-            else loginFail("ecobee didn't accept that password.")
+            else loginFail(WRONG_PASSWORD)
             break
         case "mfa":
             lg.step = "mfa"
             lg.error = (body?.toLowerCase()?.contains("expired")) ? "That code has expired. Start over to get a new one." : "That code wasn't accepted. Check it and try again."
             state.login = lg
-            break
-        case "prompt":
-            loginFail("ecobee is asking for a sign-in step this app can't complete (${lg.promptPath}). Sign in at ecobee.com in a browser, finish what it asks, then try again.")
             break
         default:
             loginFail("ecobee's sign-in answered HTTP ${status} at the ${data.step} step.")
@@ -554,11 +606,12 @@ void followLogin(String loc) {
     lg.hops = ((lg.hops ?: 0) as int) + 1
     state.login = lg
     if (lg.hops > LOGIN_MAX_HOPS) {
-        loginFail("ecobee kept asking for more sign-in steps. Sign in at ecobee.com in a browser, finish what it asks, then try again.")
+        loginFail("ecobee kept asking for more sign-in steps. ${IN_BROWSER}")
         return
     }
-    if (loc.startsWith(REDIRECT_URI)) {
-        Map q = splitUrl(loc).query
+    Map u = splitUrl(loc)
+    if (u.host && u.host + u.path == REDIRECT_URI) {
+        Map q = u.query
         if (q.error) {
             loginFail("ecobee refused the sign-in: ${q.error_description ?: q.error}")
         } else if (q.code) {
@@ -569,9 +622,14 @@ void followLogin(String loc) {
         }
         return
     }
-    Map u = splitUrl(loc)
     if (u.host && u.host != AUTH_HOST) {
-        loginFail("ecobee's sign-in sent us somewhere unexpected (${u.host}).")
+        if (SOCIAL_HOSTS[u.host]) {
+            loginFail("This ecobee account signs in with ${SOCIAL_HOSTS[u.host]}, which the hub can't do. At ecobee.com, set a password for the account, then sign in here with your email and that password.")
+        } else if (u.host in ECOBEE_HOSTS) {
+            loginFail("ecobee's sign-in stopped at an ecobee.com page (${u.path}). ${IN_BROWSER}")
+        } else {
+            loginFail("ecobee's sign-in sent us somewhere unexpected (${u.host}).")
+        }
         return
     }
     String path = u.path
@@ -598,15 +656,22 @@ void followLogin(String loc) {
         loginRequest("challenge", "GET", path, [state: st])
     } else if (path.startsWith("/u/mfa")) {
         loginFail("ecobee asked for a verification method this app can't use (${path}). In the ecobee app, switch two-step verification to an authenticator app or text message, then try again.")
+    } else if (path.startsWith("/u/reset-password")) {
+        loginFail("ecobee wants a new password for this account. Reset it at ecobee.com, then sign in here with the new one.")
+    } else if (path.startsWith("/u/email-verification")) {
+        loginFail("ecobee wants this account's email confirmed. Use the link in ecobee's email, then try again.")
+    } else if (path.startsWith("/u/login/passwordless")) {
+        loginFail("ecobee wants a code by email to sign in, which this app can't use. ${IN_BROWSER}")
     } else if (path.startsWith("/u/")) {
-        // Prompts that only need their main button (terms, notices).
-        lg.promptPath = path
-        state.login = lg
-        loginRequest("prompt", "POST", path, [state: st], [state: st, action: "default"])
+        // Other pages (consent, terms, forms) are never answered blindly: their main button may agree to something or send an email.
+        loginFail("ecobee is asking for a sign-in step this app can't complete (${path}). ${IN_BROWSER}")
     } else {
         loginFail("ecobee's sign-in went somewhere unexpected (${path}).")
     }
 }
+
+/** Only the error code counts: login pages may carry CAPTCHA scripts whatever went wrong. */
+boolean isCaptcha(String code) { code?.toLowerCase()?.contains("captcha") ?: false }
 
 private void tokenResp(Map lg, int status, String body) {
     Map json = parseJson(body)
@@ -623,6 +688,7 @@ private void tokenResp(Map lg, int status, String body) {
     state.account = lg.email
     state.auth = [refresh: json.refresh_token, access: json.access_token, expires: now() + ((json.expires_in ?: 3600) as long) * 1000L, account: lg.email]
     state.login = [step: "done"]
+    state.revoke = null
     state.lastError = null
     app.removeSetting("password")
     app.removeSetting("mfaCode")
@@ -661,9 +727,14 @@ void withToken(String action, Map args) {
     if (rt.refreshing && now() - ((rt.refreshAt ?: 0) as long) < REFRESH_STALE_MS) return
     rt.refreshing = true
     rt.refreshAt = now()
-    asynchttpPost("refreshResp", [uri: AUTH_HOST, path: "/oauth/token", requestContentType: "application/x-www-form-urlencoded",
-        contentType: "application/json", timeout: REQUEST_TIMEOUT, textParser: true,
-        body: formEncode([grant_type: "refresh_token", client_id: CLIENT_ID, refresh_token: a.refresh])])
+    authPost("refreshResp", "/oauth/token", [grant_type: "refresh_token", client_id: CLIENT_ID, refresh_token: a.refresh])
+}
+
+/** A form POST to auth.ecobee.com's token endpoints (not the sign-in pages, which keep cookies). */
+private void authPost(String callback, String path, Map form) {
+    asynchttpPost(callback, [uri: AUTH_HOST, path: path, requestContentType: "application/x-www-form-urlencoded",
+        contentType: "application/json", headers: ["User-Agent": BROWSER_UA], timeout: REQUEST_TIMEOUT, textParser: true,
+        body: formEncode(form)])
 }
 
 void refreshResp(resp, Map data) {
@@ -1436,13 +1507,13 @@ void mergeCookies(Map lg, resp) {
     lg.cookies = jar
 }
 
-/** [host, path, query] of an absolute or relative URL. */
+/** [host, path, query] of an absolute or relative URL; the host is lowercased, without a default port. */
 Map splitUrl(String url) {
     String host = null
     String rest = url
     def m = url =~ /^(https?:\/\/[^\/?#]+)(.*)$/
     if (m.find()) {
-        host = m.group(1)
+        host = m.group(1).toLowerCase().replaceFirst(/^(https:\/\/[^:]+):443$/, '$1').replaceFirst(/^(http:\/\/[^:]+):80$/, '$1')
         rest = m.group(2) ?: "/"
     }
     int q = rest.indexOf("?")

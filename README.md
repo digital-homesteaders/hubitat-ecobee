@@ -33,8 +33,24 @@ the password is cleared from the app's settings once sign-in finishes
 - If ecobee ends the sign-in (a password change, for example), the devices
   show `healthStatus: offline`, polling stops, and the app page asks you to
   sign in again. Your devices and rules stay in place.
+- **Sign out** (in the app, under Account) forgets the sign-in on the hub.
+  **Sign out and end the sign-in at ecobee** (press it twice) also tells
+  ecobee to end it. That
+  may also sign you out of ecobee.com in a browser and of other apps that use
+  ecobee's web sign-in (Home Assistant, Homey, this app on another hub). If
+  ecobee doesn't confirm, the app page says so; changing your ecobee password
+  ends the sign-in there too. Either way, your devices stay, shown as offline,
+  until you sign in again.
 - Push notifications and email codes aren't supported as a second step.
   Switch two-step verification to an authenticator app or text message.
+- Accounts that sign in with Google, Apple, Facebook or Microsoft need an
+  ecobee password first. Set one at ecobee.com, then sign in here with your
+  email and that password.
+- If ecobee asks for anything else (accepting new terms, confirming your
+  email, resetting your password, a CAPTCHA), the app stops and says what it
+  saw rather than pressing buttons for you. Do that step at ecobee.com in a
+  browser, then sign in here again. If it's a CAPTCHA, wait a while before
+  trying again.
 
 ### Few requests
 
@@ -48,6 +64,12 @@ equipment that's running.
 | Only running equipment (heat on, fan off…) | 1 (summary; the operating state comes with it) |
 | Runtime: temperature, humidity, sensors | 2 (summary, then runtime and sensors only) |
 | Settings, schedule or holds | 2 (summary, then settings, program, events, runtime and sensors) |
+
+A thermostat sends ecobee a status report about every 3 minutes, and each
+report counts as a runtime change even when the readings are the same. So
+with the default 3-minute poll, most polls are 2 requests. What the summary
+saves is the full fetch: settings, program and events are only fetched when
+they changed.
 
 - All thermostats on the account share one summary request and one fetch.
 - Commands are gathered for 1.5 seconds, so tapping a setpoint up three times
