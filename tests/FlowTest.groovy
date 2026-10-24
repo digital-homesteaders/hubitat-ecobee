@@ -43,7 +43,11 @@ void fresh() {
     seen = []
     tokenSerial = 0
     thermo = Fixtures.thermostat()
-    auth0 = [mfa: null, wrongPassword: false, wrongCodes: 0, refreshError: null]
+    // social: where the email step redirects (Auth0 doesn't do this for social accounts by default,
+    // they get the password page; kept in case ecobee turns it on); captcha: the step that wants one
+    // (identifier, password, mfa); authHost: the
+    // host in the password step's redirect; next: where /authorize/resume redirects.
+    auth0 = [mfa: null, wrongPassword: false, wrongCodes: 0, refreshError: null, social: null, captcha: null, authHost: null, next: null, revoked: [], revokeDown: false]
 }
 
 List httpCalls() { app.calls.findAll { it[0] in ["asynchttpGet", "asynchttpPost"] } }
@@ -80,13 +84,18 @@ FakeResp serve(List call) {
             case "/u/login/identifier":
                 assert cookie.contains("did=D1")
                 assert form(p).username == EMAIL && form(p).state == "S1"
+                if (auth0.social) return redirect(auth0.social)
+                if (auth0.captcha == "identifier") return html(400, '<div data-error-code="invalid-captcha"></div>')
                 return redirect("/u/login/password?state=S2", ["auth0=A1; Path=/; HttpOnly"])
             case "/u/login/password":
                 assert cookie.contains("auth0=A1")
+                if (auth0.captcha == "password") return html(400, '<div data-error-code="invalid-captcha"></div>')
+                if (auth0.wrongPasswordPage) return html(400, auth0.wrongPasswordPage)
                 if (auth0.wrongPassword || form(p).password != PASS) return html(400, '<div data-error-code="wrong-credentials"></div>')
-                return redirect("https://auth.ecobee.com/authorize/resume?state=S3", ["auth0=A2; Path=/"])
+                return redirect("${auth0.authHost ?: 'https://auth.ecobee.com'}/authorize/resume?state=S3", ["auth0=A2; Path=/"])
             case "/authorize/resume":
                 assert cookie.contains("auth0=A2")
+                if (auth0.next) return redirect(auth0.next)
                 if (auth0.mfa == "push") return redirect("/u/mfa-push-challenge-push?state=M1")
                 if (auth0.mfa && !auth0.mfaDone) return redirect("/u/mfa-${auth0.mfa}-challenge?state=M1")
                 return redirect("${CB}?code=CODE1&state=x")
@@ -96,6 +105,7 @@ FakeResp serve(List call) {
                     return html(200, "<form>enter code</form>")
                 }
                 assert form(p).state == "M1"
+                if (auth0.captcha == "mfa") return html(400, '<div data-error-code="invalid-captcha"></div>')
                 if (auth0.wrongCodes > 0) {
                     auth0.wrongCodes--
                     return html(400, '<div data-error-code="invalid-code"></div>')
@@ -103,6 +113,12 @@ FakeResp serve(List call) {
                 assert form(p).code == "123456"
                 auth0.mfaDone = true
                 return redirect("/authorize/resume?state=S4")
+            case "/oauth/revoke":
+                Map rf = form(p)
+                assert rf.client_id && !rf.containsKey("client_secret")
+                if (auth0.revokeDown) return new FakeResp(status: 503, data: "", errorMessage: "Service Unavailable")
+                auth0.revoked << rf.token
+                return new FakeResp(status: 200, data: "")
             case "/oauth/token":
                 Map f = form(p)
                 if (f.grant_type == "authorization_code") {
@@ -265,8 +281,15 @@ check("wrong password: clear message, password cleared, not signed in") {
     auth0.wrongPassword = true
     signIn()
     assert !app.signedIn()
-    assert app.state.login.error == "ecobee didn't accept that password."
+    assert app.state.login.error.startsWith("ecobee didn't accept that password.")
     assert !app.settings.containsKey("password")
+}
+
+check("a social-only account gets the password page, and the wrong-password message says what to do") {
+    fresh()
+    auth0.wrongPassword = true
+    signIn()
+    assert app.state.login.error.contains("Google, Apple, Facebook or Microsoft, set a password at ecobee.com")
 }
 
 check("push verification is refused with what to change") {
@@ -275,6 +298,118 @@ check("push verification is refused with what to change") {
     signIn()
     assert !app.signedIn()
     assert app.state.login.error.contains("authenticator app or text message")
+}
+
+check("a Google sign-in account is told to set a password") {
+    fresh()
+    auth0.social = "https://accounts.google.com/o/oauth2/v2/auth?client_id=x&state=G1"
+    signIn()
+    assert !app.signedIn()
+    assert app.state.login.error.contains("signs in with Google")
+    assert app.state.login.error.contains("set a password")
+    assert requestPaths() == ["GET /authorize", "POST /u/login/identifier"]
+}
+
+check("an Apple sign-in account is named as Apple") {
+    fresh()
+    auth0.social = "https://appleid.apple.com/auth/authorize?state=A1"
+    signIn()
+    assert app.state.login.error.contains("signs in with Apple")
+}
+
+check("Facebook and Microsoft sign-in accounts are named too") {
+    ["https://m.facebook.com/dialog/oauth?x=1": "Facebook", "https://www.facebook.com/v18.0/dialog/oauth": "Facebook",
+     "https://login.live.com/oauth20_authorize.srf": "Microsoft", "https://login.microsoftonline.com/common/oauth2/v2.0/authorize": "Microsoft"].each { String to, String name ->
+        fresh()
+        auth0.social = to
+        signIn()
+        assert app.state.login.error.contains("signs in with ${name}"), "${to}: ${app.state.login.error}"
+    }
+}
+
+check("the callback is recognised whatever the case of its host or a :443") {
+    fresh()
+    auth0.next = "https://WWW.ecobee.com:443/home/authCallback?code=CODE1&state=x"
+    signIn()
+    assert app.signedIn()
+}
+
+check("an ecobee.com page that isn't the callback stops the sign-in with its path") {
+    fresh()
+    auth0.next = "https://www.ecobee.com/home/maintenance"
+    signIn()
+    assert !app.signedIn()
+    assert app.state.login.error.contains("ecobee.com page (/home/maintenance)")
+}
+
+check("an unknown host is still refused") {
+    fresh()
+    auth0.next = "https://evil.example.com/u/login"
+    signIn()
+    assert !app.signedIn()
+    assert app.state.login.error.contains("somewhere unexpected (https://evil.example.com)")
+}
+
+check("the auth host is matched without regard to case or :443") {
+    fresh()
+    auth0.authHost = "https://AUTH.ecobee.com:443"
+    signIn()
+    assert app.signedIn()
+}
+
+check("prompt pages are never posted to blindly") {
+    Map cases = [
+        "/u/reset-password/request/x?state=P1": "new password",
+        "/u/email-verification?state=P1": "email confirmed",
+        "/u/login/passwordless-email-challenge?state=P1": "code by email",
+        "/u/consent?state=P1": "can't complete (/u/consent)",
+        "/u/terms?state=P1": "can't complete (/u/terms)",
+    ]
+    cases.each { String next, String says ->
+        fresh()
+        auth0.next = next
+        signIn()
+        assert !app.signedIn()
+        assert app.state.login.error.contains(says), "${next}: ${app.state.login.error}"
+        assert !requestPaths().any { it.contains("/u/") && it != "POST /u/login/identifier" && it != "POST /u/login/password" }
+        assert !app.settings.containsKey("password")
+    }
+}
+
+check("a CAPTCHA at the password step is named, not shown as a wrong password") {
+    fresh()
+    auth0.captcha = "password"
+    signIn()
+    assert !app.signedIn()
+    assert app.state.login.error.contains("CAPTCHA")
+    assert !app.settings.containsKey("password")
+}
+
+check("a wrong password on a page that loads a CAPTCHA script is still a wrong password") {
+    fresh()
+    auth0.wrongPasswordPage = '<script src="https://auth.ecobee.com/captcha.js"></script><p>Wrong email or password</p>'
+    signIn()
+    assert app.state.login.error.startsWith("ecobee didn't accept that password.")
+}
+
+check("a CAPTCHA at the code step is named, not shown as a wrong code") {
+    fresh()
+    auth0.mfa = "otp"
+    auth0.captcha = "mfa"
+    signIn()
+    app.settings.mfaCode = "123456"
+    press("btnMfa")
+    drain()
+    assert !app.signedIn()
+    assert app.state.login.error.contains("CAPTCHA")
+    assert !app.settings.containsKey("mfaCode")
+}
+
+check("a CAPTCHA at the email step is named, not shown as a wrong email") {
+    fresh()
+    auth0.captcha = "identifier"
+    signIn()
+    assert app.state.login.error.contains("CAPTCHA")
 }
 
 check("a stale sign-in answer is ignored after starting over") {
@@ -400,11 +535,12 @@ check("unchecking every room sensor removes the sensor devices only") {
 
 // ---------------------------------------------------------------- app page
 
-/** Render the page; returns [refreshInterval, paragraphs, input names]. */
+/** Render the page; returns [refreshInterval, paragraphs, input names, input name -> title]. */
 Map page() {
     app.calls.removeAll { it[0] in ["paragraph", "input"] }
     Map m = app.mainPage()
-    [refresh: m.refreshInterval, text: app.callsNamed("paragraph").collect { it[1] }.join("\n"), inputs: app.callsNamed("input").collect { it[1] }]
+    [refresh: m.refreshInterval, text: app.callsNamed("paragraph").collect { it[1] }.join("\n"), inputs: app.callsNamed("input").collect { it[1] },
+     titles: app.callsNamed("input").collectEntries { [(it[1]): it[2]] }]
 }
 
 /** Answer requests until the next unanswered one is for this path. */
@@ -907,6 +1043,79 @@ check("a device Refresh whose fetch fails is retried on the next poll") {
     assert requestPaths() == ["GET /1/thermostatSummary", "GET /1/thermostat"]
     assert new JsonSlurper().parseText(seen[1][2].query.json).selection.includeSettings
     assert !app.state.forceFull
+}
+
+check("sign out forgets the sign-in on the hub only") {
+    fresh()
+    signIn()
+    page()
+    seen.clear()
+    press("btnSignOut")
+    drain()
+    assert seen.isEmpty()
+    assert auth0.revoked == []
+    assert !app.signedIn() && app.state.auth == null
+}
+
+check("sign out at ecobee also revokes the refresh token") {
+    fresh()
+    signIn()
+    page()
+    seen.clear()
+    press("btnSignOutEcobee")
+    drain()
+    // The first press only asks for a second one.
+    assert seen.isEmpty() && app.signedIn()
+    Map p = page()
+    assert p.titles.btnSignOutEcobee == "Press again to end the sign-in at ecobee"
+    assert p.refresh == 5
+    assert app.confirmingRevoke()
+    press("btnSignOutEcobee")
+    assert page().refresh == 2
+    drain()
+    assert requestPaths() == ["POST /oauth/revoke"]
+    assert auth0.revoked == ["RT1"]
+    assert !app.signedIn() && app.state.auth == null
+    assert app.calls.any { it[0] == "unschedule" }
+    assert !app.log.lines.any { it[1].contains("RT1") }
+    p = page()
+    assert p.refresh == 0 && !p.text.contains("didn't confirm")
+}
+
+check("a second press after the confirm window only asks again") {
+    fresh()
+    signIn()
+    press("btnSignOutEcobee")
+    hub.clock += 31_000
+    // The page has redrawn by now, so the button no longer says "Press again".
+    Map p = page()
+    assert p.titles.btnSignOutEcobee == "Sign out and end the sign-in at ecobee" && p.refresh == 0
+    seen.clear()
+    press("btnSignOutEcobee")
+    drain()
+    assert seen.isEmpty() && app.signedIn()
+    press("btnSignOutEcobee")
+    drain()
+    assert requestPaths() == ["POST /oauth/revoke"] && !app.signedIn()
+}
+
+check("sign out still forgets the sign-in when ecobee doesn't answer the revoke") {
+    fresh()
+    signIn()
+    auth0.revokeDown = true
+    press("btnSignOutEcobee")
+    press("btnSignOutEcobee")
+    drain()
+    assert !app.signedIn() && app.state.auth == null
+    assert app.log.at("warn").any { it.contains("didn't confirm ending the sign-in (HTTP 503)") }
+    // The page says so too, with what to do, until the next sign-in.
+    assert page().text.contains("didn't confirm ending the sign-in (HTTP 503)")
+    assert page().text.contains("change your ecobee password")
+    auth0.revokeDown = false
+    tokenSerial = 0
+    signIn()
+    app.signOut()
+    assert !page().text.contains("didn't confirm")
 }
 
 check("signing in to a different account starts the picks over; the same account keeps them") {

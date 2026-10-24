@@ -172,6 +172,11 @@ check("URLs: absolute and relative, query decoded") {
     assert u.host == null && u.path == "/authorize/resume" && u.query.state == "Z"
     u = app.splitUrl("https://www.ecobee.com/home/authCallback?code=C1&state=S")
     assert u.query.code == "C1"
+    // Hosts compare as written by anyone: lowercased, without a default port.
+    assert app.splitUrl("https://WWW.Ecobee.com:443/home/authCallback").host == "https://www.ecobee.com"
+    assert app.splitUrl("http://auth.ecobee.com:80/x").host == "http://auth.ecobee.com"
+    assert app.splitUrl("https://auth.ecobee.com:8443/x").host == "https://auth.ecobee.com:8443"
+    assert app.splitUrl("https://www.ecobee.com/Home/AuthCallback").path == "/Home/AuthCallback"
 }
 
 check("cookies: several headers, entries, shared header, deletions") {
