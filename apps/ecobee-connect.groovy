@@ -115,16 +115,20 @@ def mainPage() {
     Map lg = state.login ?: [:]
     boolean working = loginWorking()
     boolean finding = discovering()
-    // The page refreshes itself while signing in, until the devices exist, while ecobee answers a
-    // sign-out, and while waiting for the second press so the button reads right when that ends.
-    dynamicPage(name: "mainPage", title: "Ecobee Connect", install: true, uninstall: true, refreshInterval: (working || finding || revoking()) ? 2 : confirmingRevoke() ? 5 : 0) {
+    // The page refreshes itself while signing in, until the devices exist, and while ecobee answers
+    // a sign-out. Not while waiting for the second press: a refresh would drop edits made meanwhile.
+    boolean ending = revoking()
+    dynamicPage(name: "mainPage", title: "Ecobee Connect", install: true, uninstall: true, refreshInterval: (working || finding || ending) ? 2 : 0) {
         if (!signedIn()) {
             section("Sign in to ecobee") {
-                if (state.revoke?.failed) paragraph "<b>Signed out on the hub, but ecobee didn't confirm ending the sign-in (HTTP ${state.revoke.failed}).</b> To end it at ecobee, change your ecobee password."
+                if (state.revoke?.failed) paragraph "<b>Signed out on the hub, but ecobee didn't confirm ending the sign-in (${state.revoke.failed}).</b> To end it at ecobee, change your ecobee password."
                 if (state.auth?.needsLogin) paragraph "<b>ecobee asked for a new sign-in.</b> Your devices stay in place and come back once you sign in."
                 if (working) {
                     // While ecobee answers, show progress only; the form would look like a failed sign-in.
                     paragraph lg.mfaKind ? "Checking your code with ecobee…" : "Signing in to ecobee…"
+                } else if (ending) {
+                    // No form while the page still refreshes itself: a refresh would wipe what was typed.
+                    paragraph "Ending the sign-in at ecobee…"
                 } else if (lg.step == "mfa") {
                     paragraph mfaPrompt(lg.mfaKind as String)
                     input "mfaCode", "text", title: "Verification code", required: false
@@ -442,10 +446,6 @@ void signOut(boolean atEcobee = false) {
     unschedule()
     String refresh = state.auth?.refresh
     state.revoke = null
-    if (atEcobee && refresh) {
-        state.revoke = [at: now()]
-        authPost("revokeResp", "/oauth/revoke", [client_id: CLIENT_ID, token: refresh])
-    }
     state.confirmRevokeUntil = null
     state.auth = null
     state.login = null
@@ -453,6 +453,14 @@ void signOut(boolean atEcobee = false) {
     runtime().clear()
     markAllHealth("offline")
     log.info "Ecobee Connect: signed out"
+    if (!atEcobee || !refresh) return
+    // After the hub has forgotten the token, so a failure here can't leave it half signed out.
+    state.revoke = [at: now()]
+    try {
+        authPost("revokeResp", "/oauth/revoke", [client_id: CLIENT_ID, token: refresh])
+    } catch (e) {
+        revokeFailed("couldn't send: ${e.message}")
+    }
 }
 
 boolean confirmingRevoke() { now() < ((state.confirmRevokeUntil ?: 0) as long) }
@@ -461,14 +469,20 @@ boolean confirmingRevoke() { now() < ((state.confirmRevokeUntil ?: 0) as long) }
 boolean revoking() { state.revoke?.at && now() - (state.revoke.at as long) < (REQUEST_TIMEOUT + 5) * 1000L }
 
 void revokeResp(resp, Map data) {
+    // A late answer after a sign-out or a new sign-in cleared the revoke has nothing to report on.
+    if (!state.revoke?.at) return
     int status = statusOf(resp)
     if (status == 200) {
         state.revoke = null
         logDebug "ecobee ended the sign-in"
         return
     }
-    state.revoke = [failed: status]
-    log.warn "Ecobee Connect: signed out on the hub, but ecobee didn't confirm ending the sign-in (HTTP ${status}). The hub has forgotten it either way."
+    revokeFailed(status ? "HTTP ${status}" : "no answer")
+}
+
+private void revokeFailed(String why) {
+    state.revoke = [failed: why]
+    log.warn "Ecobee Connect: signed out on the hub, but ecobee didn't confirm ending the sign-in (${why}). The hub has forgotten it either way."
 }
 
 private Map runtime() {
